@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import cast
 import numpy as np
 from dataclasses import dataclass, field
 import jax
@@ -7,6 +9,18 @@ import mujoco
 from mujoco import mjx
 from mujoco.mjx._src import support as mjx_support
 from dynamics_wrapper import DynamicsWrapper
+from load_free_flyer import load_urdf
+
+
+ROOT_FOLDER = Path(__file__).parent.parent
+jax.config.update("jax_compilation_cache_dir", (ROOT_FOLDER / "jax_cache").as_posix())
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update(
+    "jax_persistent_cache_enable_xla_caches",
+    "xla_gpu_per_fusion_autotune_cache_dir",
+)
+# jax.config.update("jax_logging_level", "DEBUG")
 
 
 @dataclass
@@ -18,7 +32,7 @@ class ConstraintsConfig:
 class HorizontalPlaneConstraintConfig(ConstraintsConfig):
     kp: float = 100
     kd: float = float(2 * np.sqrt(100))
-    anchor_name: str = "ee_link"
+    anchor_name: str = "robot_root"
     z: float | None = None
 
 
@@ -32,7 +46,7 @@ class WheelsConstraintConfig(ConstraintsConfig):
 
 
 @dataclass
-class PinocchioConfig:
+class MujocoConfig:
     dt: float = 0.05
     init_pos: list[float] = field(default_factory=lambda: [0, 0, 0])
     init_ori: list[float] = field(default_factory=lambda: [0, 0, 0, 1])
@@ -46,7 +60,7 @@ class PinocchioConfig:
     )
     fixed: bool = False
     numerical_opt: bool = True
-    visualize_link: str | None = "chassis_link"
+    visualize_link: str | None = "robot_root"
 
 
 class Constraint(ABC):
@@ -265,7 +279,8 @@ class HorizontalPlaneConstraint(Constraint):
 
 class WheelsConstraint(Constraint):
     """No-slip rolling: c_w = (v_lin_w)^xy - theta_dot*r*(a x e_z)^xy. d(c_w)/dt = A_w @ a + drift_w,
-    drift_w = (d(c_w)/dq) @ dq_dt. Stabilization: A_w @ a = b_w with b_w = -k_d*c_w - drift_w."""
+    drift_w = (d(c_w)/dq) @ dq_dt. Stabilization: A_w @ a = b_w with b_w = -k_d*c_w - drift_w.
+    """
 
     def __init__(self, model_cpu: mujoco.MjModel, cfg: WheelsConstraintConfig):
         self._wheel_joint_names = cfg.wheel_joints
@@ -310,9 +325,13 @@ class WheelsConstraint(Constraint):
 
             def c_w_fn(q_arg: jax.Array) -> jax.Array:
                 d = mjx.forward(model, data.replace(qpos=q_arg, qvel=v))
-                R = d.xmat[parent_id].reshape(3, 3) if parent_id >= 0 else d.xmat[body_id].reshape(3, 3)
+                rot_parent = (
+                    d.xmat[parent_id].reshape(3, 3)
+                    if parent_id >= 0
+                    else d.xmat[body_id].reshape(3, 3)
+                )
                 jac_p, _ = mjx_support.jac(model, d, d.xpos[body_id], body_id)
-                jac_lin = R.T @ jac_p.T
+                jac_lin = rot_parent.T @ jac_p.T
                 vel_lin = jac_lin @ v
                 exp_vel = v[dof_id] * radius * jnp.cross(axis, base_axes[2])
                 return (vel_lin - exp_vel)[:2]
@@ -359,36 +378,46 @@ class MjxWrapper(DynamicsWrapper):
 
     def __init__(
         self,
-        model: mujoco.MjModel,
+        cfg: MujocoConfig,
         num_envs: int = 1,
-        constraints: list[Constraint] | None = None,
-        device: str = "cpu",
+        device: jax.Device | None = None,
         actor_root_body: dict[str, str] | None = None,
-    ):
-        """
-        actor_root_body: map actor name -> root body (link) name.
-        E.g. {"robot": "base_link"} so get_actor_position_by_name("robot") returns base_link position.
-        If an actor name is not in the map, it is used as the body name (lookup by body name).
-        """
+        warmup: bool = True,
+    ) -> None:
+        model_folder = ROOT_FOLDER / Path(cfg.urdf_path).parent
+        filename = Path(cfg.urdf_path).name
+        model, data = load_urdf(model_folder, filename, fixed=cfg.fixed)
+        model.opt.timestep = cfg.dt
+        mujoco.mj_forward(model, data)
+
+        constraints: list[Constraint] = []
+        for c in cfg.constraints_cfg:
+            if isinstance(c, HorizontalPlaneConstraintConfig):
+                constraints.append(HorizontalPlaneConstraint(model, data, c))
+            elif isinstance(c, WheelsConstraintConfig):
+                constraints.append(WheelsConstraint(model, c))
+
+        self._device = cast(jax.Device, device or jax.devices()[0])
         self._model_cpu = model
-        self._model = mjx.put_model(model)
+        self._model = mjx.put_model(model, device=self._device)
         self._num_envs = num_envs
-        self._constraints = constraints or []
-        self._device = device
-        self._dt = model.opt.timestep
+        self._constraints = constraints
+        self._dt = cfg.dt
         self._actor_root_body = actor_root_body or {}
 
         data_cpu = mujoco.MjData(model)
         mujoco.mj_forward(model, data_cpu)
 
         self._data = jax.vmap(
-            lambda _: mjx.put_data(model, data_cpu),
+            lambda _: mjx.put_data(model, data_cpu, device=self._device),
         )(jnp.arange(num_envs))
 
-        self._ctrl = jnp.zeros((num_envs, model.nu))
+        self._ctrl = jnp.zeros((num_envs, model.nv))
         self._visualize_link_buffer: list[jax.Array] = []
 
         self._step_fn = jax.jit(jax.vmap(self._step_single, in_axes=(None, 0, 0)))
+        if warmup:
+            self._step_fn(self._model, self._data, self._ctrl)
 
     def _step_single(
         self,
@@ -398,7 +427,8 @@ class MjxWrapper(DynamicsWrapper):
     ) -> mjx.Data:
         """Step single environment with constrained dynamics."""
         # Apply control
-        data = data.replace(qfrc_applied=ctrl)
+        current_ctrl = ctrl
+        data = data.replace(qfrc_applied=current_ctrl)
 
         if not self._constraints:
             return mjx.step(model, data)
@@ -417,7 +447,11 @@ class MjxWrapper(DynamicsWrapper):
 
         for constraint in self._constraints:
             jac, bias = constraint.compute(
-                data.qpos, data.qvel, model, data, self._model_cpu
+                data.qpos,
+                data.qvel,
+                model,
+                data,
+                self._model_cpu,
             )
             if jac.shape[0] > 0:
                 constraint_jac_blocks.append(jac)
@@ -461,8 +495,16 @@ class MjxWrapper(DynamicsWrapper):
         return self._num_envs
 
     @property
-    def device(self) -> str:
+    def device(self) -> jax.Device:
         return self._device
+
+    @property
+    def nv(self) -> int:
+        return self._model.nv
+
+    @property
+    def nq(self) -> int:
+        return self._model_cpu.nq
 
     @property
     def dt(self) -> float:
@@ -477,7 +519,12 @@ class MjxWrapper(DynamicsWrapper):
         """
         qpos = self._data.qpos
         qvel = self._data.qvel
-        return jnp.stack([qpos, qvel], axis=-1)
+        res = jnp.zeros(
+            (self._num_envs, max(self._model_cpu.nq, self._model_cpu.nv), 2)
+        )
+        res = res.at[:, : self._model_cpu.nq, 0].set(qpos)
+        res = res.at[:, : self._model_cpu.nv, 1].set(qvel)
+        return res
 
     def set_dof_state(self, v: jax.Array) -> None:
         """
@@ -498,7 +545,7 @@ class MjxWrapper(DynamicsWrapper):
         )(self._data, qpos, qvel)
 
     def apply_robot_cmd(self, u: jax.Array) -> None:
-        """Apply control to the single controllable actor (robot). u: [num_envs, nu] or [nu]."""
+        """Apply generalized forces (qfrc_applied). u: [num_envs, nv] or [nv]."""
         if u.ndim == 1:
             u = jnp.broadcast_to(u, (self._num_envs, u.shape[0]))
         self._ctrl = u

@@ -36,6 +36,12 @@ subf % use and configure subfig package for nested figure numbering
 \usepackage[onehalfspacing]{setspace} % полуторный интервал
 \usepackage{fancyhdr} % установка колонтитулов
 \usepackage{listings} % поддержка вставки исходного кода
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\floatname{algorithm}{Алгоритм}
+\renewcommand{\algorithmicrequire}{\textbf{Вход:}}
+\renewcommand{\algorithmicensure}{\textbf{Выход:}}
 
 % Установка шрифта Times New Roman
 \renewcommand{\rmdefault}{ftm}

@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "ms-thesis"
+version = "0.0.1"
+description = "my master thesis"
+authors = [
+  "Mileshin Ilia <i.milyoshin@innopolis.ru>",
+]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+mujoco = "^3.5.0"
+mujoco-mjx = "^3.5.0"
+torch = "^2.1.2"
+warp-lang = "^1.11.1"
+packaging = "^26.0"
+jax = { version = "^0.8.0", extras = ["cuda12"] }
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+pyright = "^1.1.408"
+
+[tool.pyright]
+stubPath = "typings"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

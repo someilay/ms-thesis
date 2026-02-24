@@ -10,6 +10,7 @@
         "james-yu.latex-workshop",
         "valentjn.vscode-ltex",
         "streetsidesoftware.code-spell-checker",
+        "streetsidesoftware.code-spell-checker-russian",
         "tecosaur.latex-utilities",
         "quarto.quarto"
       ],
@@ -115,6 +116,8 @@
     }
   },
   "postCreateCommand": "echo 'LaTeX devcontainer ready!'",
-  "remoteUser": "vscode"
+  "remoteUser": "vscode",
+  "mounts": [
+    "source=/home/ilia-mileshin/.ssh,target=/home/vscode/.ssh,type=bind"
+  ]
 }
-

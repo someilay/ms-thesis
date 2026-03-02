@@ -62,6 +62,11 @@ class MPPI:
         self.u_seq = jnp.zeros((self.t, self.nu))
         self.key = jax.random.PRNGKey(0)
 
+    def reset(self) -> None:
+        """Reset nominal control sequence and PRNG key to initial state."""
+        self.u_seq = jnp.zeros((self.t, self.nu))
+        self.key = jax.random.PRNGKey(0)
+
     def _importance_weights(self, costs: jax.Array) -> jax.Array:
         """Softmin importance weights. costs [K] -> weights [K]."""
         shifted = costs - costs.min()

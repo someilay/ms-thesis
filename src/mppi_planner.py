@@ -23,14 +23,18 @@ class MPPIMujocoPlanner:
         self.sim = MjxWrapper(
             cfg=cfg.muj_cfg,
             num_envs=cfg.mppi_cfg.num_samples,
+            warmup=False,
         )
 
         self._cost_fn = self.objective.build_cost_fn(self.sim)
         self._applied_u_single = jnp.zeros((1, self.sim.nv), dtype=jnp.float32)
 
-        step_batch_costed = self.sim.build_step_batch_costed(self._cost_fn)
         nv, nu = self.sim.nv, cfg.mppi_cfg.nu
         k, t = cfg.mppi_cfg.num_samples, cfg.mppi_cfg.horizon
+
+        # AOT-compile both hot paths; tracing happens here, not at call time.
+        step_batch_costed = self.sim.build_step_batch_costed(self._cost_fn, t)
+        self._constrained_force = self.sim.build_constrained_force()
 
         def rollout_fn(perturbed_actions: jax.Array) -> jax.Array:
             # perturbed_actions: [K, T, nu] -> costs [T, K]
@@ -55,8 +59,7 @@ class MPPIMujocoPlanner:
     def compute_action_tensor(self, dof_state_tensor: jax.Array) -> jax.Array:
         self.reset_rollout_sim(dof_state_tensor)
         u = self._to_applied_u_single(self.command())
-        u = self.sim.constrained_force(u)
-        return u
+        return self._constrained_force(u)
 
     def command(self) -> jax.Array:
         action = self.mppi.command()

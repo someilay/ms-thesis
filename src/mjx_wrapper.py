@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 from typing import Callable, cast
 import numpy as np
 from dataclasses import dataclass, field
@@ -12,14 +13,6 @@ from load_free_flyer import load_urdf
 
 
 ROOT_FOLDER = Path(__file__).parent.parent
-jax.config.update("jax_compilation_cache_dir", (ROOT_FOLDER / "jax_cache").as_posix())
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update(
-    "jax_persistent_cache_enable_xla_caches",
-    "xla_gpu_per_fusion_autotune_cache_dir",
-)
-# jax.config.update("jax_logging_level", "DEBUG")
 
 
 @dataclass
@@ -93,7 +86,10 @@ class MjxWrapper:
 
         self._step_fn = jax.jit(jax.vmap(self._step_single, in_axes=(None, 0, 0)))
         if warmup:
+            start_time = time.perf_counter()
             self._step_fn(self._model, self._data, self._ctrl)
+            end_time = time.perf_counter()
+            print(f"MjxWrapper warmup took {end_time - start_time:.2f} seconds")
 
         # setup goal positions and orientations
         self._goal_pos = jnp.zeros((self._num_envs, 3), dtype=np.float32)
@@ -250,17 +246,52 @@ class MjxWrapper:
             )
         return True
 
+    @staticmethod
+    def _export_compile(
+        fn: Callable,
+        example_args: tuple,
+        cache_path: Path,
+    ) -> Callable:
+        """Persist the StableHLO export so tracing is skipped on process restart.
+
+        fn must have only plain JAX arrays (no mjx.Data) in its signature.
+        Closed-over mjx.Data is fine: it gets compiled in as constants.
+        """
+        if cache_path.exists():
+            t0 = time.perf_counter()
+            exported = jax.export.deserialize(bytearray(cache_path.read_bytes()))
+            print(f"  loaded {cache_path.name}: {time.perf_counter() - t0:.2f}s")
+        else:
+            t0 = time.perf_counter()
+            exported = jax.export.export(jax.jit(fn))(*example_args)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(exported.serialize())
+            print(f"  traced+saved {cache_path.name}: {time.perf_counter() - t0:.2f}s")
+
+        compiled = jax.jit(exported.call)
+        t0 = time.perf_counter()
+        jax.block_until_ready(compiled(*example_args))
+        print(f"  compiled {cache_path.name}: {time.perf_counter() - t0:.2f}s")
+        return compiled
+
     def build_step_batch_costed(
         self,
         cost_fn: Callable[[mjx.Data, jax.Array], jax.Array],
+        horizon: int,
     ) -> Callable[[jax.Array], tuple[jax.Array, jax.Array]]:
-        @jax.jit
+        _, data_treedef = jax.tree_util.tree_flatten(self._data)
+
+        # mjx.Data is flattened to a plain tuple of arrays so jax.export can
+        # serialize the function signature. data_treedef is a static closure
+        # variable: baked into the HLO at trace time, not part of the signature.
         def _step_batch_costed(
             u_batch: jax.Array,
-            initial_data: mjx.Data,
+            flat_data: tuple,
             goal_pos: jax.Array,
-        ) -> tuple[mjx.Data, jax.Array, jax.Array]:
-            def _step_single(
+        ) -> tuple[jax.Array, jax.Array]:
+            initial_data = jax.tree_util.tree_unflatten(data_treedef, flat_data)
+
+            def _step_carry(
                 data: mjx.Data,
                 u: jax.Array,
             ) -> tuple[mjx.Data, tuple[jax.Array, jax.Array]]:
@@ -271,18 +302,64 @@ class MjxWrapper:
                     pos = data.xpos[:, self._visualize_link_id, :]
                 return data, (cost, pos)
 
-            initial_data, (costs, link_buffer) = jax.lax.scan(
-                _step_single, initial_data, u_batch
-            )
-            return initial_data, costs, link_buffer
+            _, (costs, link_buffer) = jax.lax.scan(_step_carry, initial_data, u_batch)
+            return costs, link_buffer
+
+        flat_data_example = tuple(jax.tree_util.tree_leaves(self._data))
+        u_batch_example = jnp.zeros(
+            (horizon, self._num_envs, self.nv), dtype=jnp.float32
+        )
+        cache_path = (
+            ROOT_FOLDER
+            / "jax_cache"
+            / "exports"
+            / f"step_batch_costed_T{horizon}_K{self._num_envs}_nv{self.nv}.stablehlo"
+        )
+        _compiled = self._export_compile(
+            _step_batch_costed,
+            (u_batch_example, flat_data_example, self._goal_pos),
+            cache_path,
+        )
 
         def step_batch_costed(u_batch: jax.Array) -> tuple[jax.Array, jax.Array]:
-            _, costs, self._visualize_link_buffer = _step_batch_costed(
-                u_batch, self._data, self._goal_pos
+            flat_data = tuple(jax.tree_util.tree_leaves(self._data))
+            costs, self._visualize_link_buffer = _compiled(
+                u_batch,
+                flat_data,
+                self._goal_pos,
             )
             return costs, cast(jax.Array, self._visualize_link_buffer)
 
         return step_batch_costed
+
+    def build_constrained_force(self) -> Callable[[jax.Array], jax.Array]:
+        _, data_treedef = jax.tree_util.tree_flatten(self._data)
+
+        def _constrained_force(flat_data: tuple, u: jax.Array) -> jax.Array:
+            data = jax.tree_util.tree_unflatten(data_treedef, flat_data)
+            return self._step_fn(self._model, data, u).qfrc_applied
+
+        flat_data_example = tuple(jax.tree_util.tree_leaves(self._data))
+        u_example = jnp.zeros((self._num_envs, self.nv), dtype=jnp.float32)
+        cache_path = (
+            ROOT_FOLDER
+            / "jax_cache"
+            / "exports"
+            / f"constrained_force_K{self._num_envs}_nv{self.nv}.stablehlo"
+        )
+        _compiled = self._export_compile(
+            _constrained_force,
+            (flat_data_example, u_example),
+            cache_path,
+        )
+
+        def constrained_force(u: jax.Array) -> jax.Array:
+            if u.ndim == 1 or u.shape[0] != self._num_envs:
+                u = jnp.broadcast_to(u, (self._num_envs, self.nv))
+            flat_data = tuple(jax.tree_util.tree_leaves(self._data))
+            return _compiled(flat_data, u)[0]
+
+        return constrained_force
 
     def raise_if_nan(self) -> None:
         """Check current state for nan/inf with a single device-host sync.
